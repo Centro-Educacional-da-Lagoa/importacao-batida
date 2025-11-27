@@ -1,0 +1,19 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlserver"
+  url      = env("DATABASE_URL")
+}
+
+model TB_MDP_Processo_Importacao_Batida {
+  ID_Job                 Int      @id(map: "PK_MDP_Processo_Importacao_Batida")
+  CD_Coligada_Execucao   String   @db.VarChar(20)
+  NM_Equipamento         String   @db.VarChar(120)
+  TX_Arquivo_Importado   String   @db.NVarChar(Max)
+  ID_Status_Job          Int      @db.SmallInt
+  CD_Usuario_Criacao     String   @db.VarChar(20)
+  DH_Criacao             DateTime @db.DateTime
+  IN_Notificacao_Enviada Int      @db.TinyInt
+}

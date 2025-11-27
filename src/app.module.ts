@@ -9,6 +9,7 @@ import { ApiKeyGuard } from './auth/api-key.guard';
 import { ScheduleModule } from '@nestjs/schedule';
 import { ConfigModule } from '@nestjs/config';
 import { BullModule } from '@nestjs/bull';
+import { PrismaService } from './prisma/prisma.service';
 
 @Module({
   imports: [
@@ -35,6 +36,8 @@ import { BullModule } from '@nestjs/bull';
       provide: APP_GUARD,
       useClass: ApiKeyGuard,
     },
+    PrismaService,
   ],
+  exports: [PrismaService],
 })
 export class AppModule {}

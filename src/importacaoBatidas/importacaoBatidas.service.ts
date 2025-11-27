@@ -17,6 +17,7 @@ import {
   EquipamentoMapeado,
 } from './constants/equipamentos.constants';
 import { GoogleDriveService } from '../google-drive/google-drive.service';
+import { PrismaService } from '../prisma/prisma.service';
 
 const delay = (ms: number) => new Promise((res) => setTimeout(res, ms));
 
@@ -32,7 +33,10 @@ export class ImportacaoBatidasService {
 
   private axiosInstance: AxiosInstance;
 
-  constructor(private readonly googleDriveService: GoogleDriveService) {
+  constructor(
+    private readonly googleDriveService: GoogleDriveService,
+    private readonly prismaService: PrismaService,
+  ) {
     const {
       RHID_API_URL,
       RHID_API_USERNAME,
@@ -230,6 +234,7 @@ export class ImportacaoBatidasService {
         equipamentoRhid,
         nomeArquivo,
         dataReferencia,
+        conteudoAfd,
       );
 
       if (!sucessoImportacao) {
@@ -482,7 +487,9 @@ export class ImportacaoBatidasService {
     equipamentoRhid: RhidDevice,
     nomeArquivo: string,
     dataReferencia: Date,
+    conteudoAfd: string,
   ): Promise<boolean> {
+    let sucesso = false;
     try {
       console.log(
         `📤 Executando importação TOTVS para equipamento ${equipamentoRhid.name}...`,
@@ -585,10 +592,6 @@ export class ImportacaoBatidasService {
           },
         },
       };
-      console.log(
-        '🚀 ~ ImportacaoBatidasService ~ executarImportacaoTotvs ~ payload:',
-        payload,
-      );
 
       const response = await this.axiosInstance.post(
         `${this.totvsApiUrl}/rest/restprocess/executeprocess/PtoProcImportacaoBatidas`,
@@ -607,7 +610,7 @@ export class ImportacaoBatidasService {
       );
 
       // Validar se retorno é "1" (sucesso)
-      const sucesso = response.data === '1' || response.data === 1;
+      sucesso = response.data === '1' || response.data === 1;
 
       if (sucesso) {
         console.log(
@@ -630,6 +633,74 @@ export class ImportacaoBatidasService {
           error instanceof Error ? error.message : error
         }`,
       );
+    } finally {
+      try {
+        // Adiciona um tempo de espera para garantir que o job foi registrado no banco de dados.
+        // O tempo pode precisar de ajuste dependendo do ambiente.
+        await delay(5000);
+
+        console.log('🔍 Buscando informações do job de importação...');
+
+        const jobResult: any[] = await this.prismaService.$queryRaw`
+              SELECT TOP 1
+                  jobx.IDJOB AS ID_Job,
+                  exjb.status AS ID_Status_Job,
+                  jobx.codusuario AS CD_Usuario,
+                  jobx.datacriacao AS DH_Criacao
+              FROM corpore_erp_manutencao.dbo.gjobx AS jobx (nolock)
+              LEFT JOIN corpore_erp_manutencao.dbo.gjobxexecucaoview AS exjb (nolock)
+                  ON jobx.idjob = exjb.idjob
+              WHERE jobx.codusuario = 'PortalMatriculaInt'
+                  AND jobx.classeprocesso = 'PtoProcImportacaoBatidas'
+              ORDER BY jobx.datacriacao DESC
+          `;
+
+        if (jobResult && jobResult.length > 0) {
+          const jobInfo = jobResult[0];
+          const conteudoAfdBase64 = Buffer.from(conteudoAfd).toString('base64');
+
+          console.log(
+            `✍️  Registrando log do job ${jobInfo.ID_Job} no banco de dados...`,
+          );
+
+          await this.prismaService.$executeRaw`
+              INSERT INTO BD_SINERGIA.dbo.TB_MDP_Processo_Importacao_Batida (
+                  ID_Job,
+                  CD_Coligada_Execucao,
+                  NM_Equipamento,
+                  TX_Arquivo,
+                  ID_Status_Job,
+                  CD_Usuario_Criacao,
+                  DH_Criacao,
+                  IN_Notificacao_Enviada,
+                  IN_Importacao_Realizada
+              ) VALUES (
+                  ${jobInfo.ID_Job},
+                  ${equipamento.CD_Coligada},
+                  ${equipamentoRhid.name},
+                  ${conteudoAfdBase64},
+                  ${jobInfo.ID_Status_Job},
+                  ${jobInfo.CD_Usuario},
+                  ${jobInfo.DH_Criacao},
+                  0,
+                  0
+              )
+          `;
+
+          console.log(
+            `✅ Log do job ${jobInfo.ID_Job} registrado com sucesso.`,
+          );
+        } else {
+          console.log(
+            '⚠️ Não foi possível encontrar o job de importação para registrar o log.',
+          );
+        }
+      } catch (logError) {
+        console.error(
+          '❌ Erro ao registrar o log do job de importação:',
+          logError,
+        );
+      }
     }
   }
 
