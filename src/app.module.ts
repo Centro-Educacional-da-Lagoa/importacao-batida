@@ -9,7 +9,9 @@ import { ApiKeyGuard } from './auth/api-key.guard';
 import { ScheduleModule } from '@nestjs/schedule';
 import { ConfigModule } from '@nestjs/config';
 import { BullModule } from '@nestjs/bull';
-import { PrismaService } from './prisma/prisma.service';
+import { PrismaModule } from './prisma/prisma.module';
+import { NotificacaoRotinaModule } from './notificacao-rotina/notificacao-rotina.module';
+import { ChatModule } from './google/chat/chat.module';
 
 @Module({
   imports: [
@@ -27,6 +29,9 @@ import { PrismaService } from './prisma/prisma.service';
         password: process.env.REDIS_PASSWORD,
       },
     }),
+    PrismaModule,
+    NotificacaoRotinaModule,
+    ChatModule,
   ],
 
   controllers: [AppController],
@@ -36,8 +41,6 @@ import { PrismaService } from './prisma/prisma.service';
       provide: APP_GUARD,
       useClass: ApiKeyGuard,
     },
-    PrismaService,
   ],
-  exports: [PrismaService],
 })
 export class AppModule {}

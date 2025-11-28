@@ -1,13 +1,12 @@
 import { Module } from '@nestjs/common';
 import { ScheduleModule } from '@nestjs/schedule';
-import { GoogleDriveModule } from '../google-drive/google-drive.module';
 import { ImportacaoBatidasController } from './importacaoBatidas.controller';
 import { ImportacaoBatidasService } from './importacaoBatidas.service';
-import { PrismaService } from 'src/prisma/prisma.service';
+
 @Module({
-  imports: [ScheduleModule.forRoot(), GoogleDriveModule],
+  imports: [ScheduleModule.forRoot()],
   controllers: [ImportacaoBatidasController],
-  providers: [ImportacaoBatidasService, PrismaService],
+  providers: [ImportacaoBatidasService],
   exports: [ImportacaoBatidasService],
 })
 export class ImportacaoBatidasModule {}

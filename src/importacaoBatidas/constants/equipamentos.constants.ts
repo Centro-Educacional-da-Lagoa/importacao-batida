@@ -7,6 +7,12 @@ export interface EquipamentoMapeado {
 
 export const EQUIPAMENTOS_MAPEADOS: EquipamentoMapeado[] = [
   {
+    id: 6,
+    CD_Coligada: 1,
+    CD_Filial: 2,
+    CD_Terminal_Coleta: 9006,
+  },
+  {
     id: 1,
     CD_Coligada: 5,
     CD_Filial: 1,
