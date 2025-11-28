@@ -18,6 +18,8 @@ import {
 } from './constants/equipamentos.constants';
 import { GoogleDriveService } from '../google-drive/google-drive.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { S3Service } from '../s3/s3.service';
+import { randomUUID } from 'crypto';
 
 const delay = (ms: number) => new Promise((res) => setTimeout(res, ms));
 
@@ -36,41 +38,33 @@ export class ImportacaoBatidasService {
   constructor(
     private readonly googleDriveService: GoogleDriveService,
     private readonly prismaService: PrismaService,
+    private readonly s3Service: S3Service,
   ) {
-    const {
-      RHID_API_URL,
-      RHID_API_USERNAME,
-      RHID_API_PASSWORD,
-      URL_API_TOTVS,
-      TOKEN_API_TOTVS,
-      PATH_IMPORTACAO_TOTVS,
-    } = process.env;
-
-    if (!RHID_API_URL)
+    if (!process.env.RHID_API_URL)
       throw new Error('Missing required environment variable: RHID_API_URL');
-    if (!RHID_API_USERNAME)
+    if (!process.env.RHID_API_USERNAME)
       throw new Error(
         'Missing required environment variable: RHID_API_USERNAME',
       );
-    if (!RHID_API_PASSWORD)
+    if (!process.env.RHID_API_PASSWORD)
       throw new Error(
         'Missing required environment variable: RHID_API_PASSWORD',
       );
-    if (!URL_API_TOTVS)
+    if (!process.env.URL_API_TOTVS)
       throw new Error('Missing required environment variable: URL_API_TOTVS');
-    if (!TOKEN_API_TOTVS)
+    if (!process.env.TOKEN_API_TOTVS)
       throw new Error('Missing required environment variable: TOKEN_API_TOTVS');
-    if (!PATH_IMPORTACAO_TOTVS)
+    if (!process.env.PATH_IMPORTACAO_TOTVS)
       throw new Error(
         'Missing required environment variable: PATH_IMPORTACAO_TOTVS',
       );
 
-    this.rhidApiUrl = RHID_API_URL;
-    this.rhidUsername = RHID_API_USERNAME;
-    this.rhidPassword = RHID_API_PASSWORD;
-    this.totvsApiUrl = URL_API_TOTVS;
-    this.totvsBasicAuth = TOKEN_API_TOTVS;
-    this.pathImportacaoTotvs = PATH_IMPORTACAO_TOTVS;
+    this.rhidApiUrl = process.env.RHID_API_URL;
+    this.rhidUsername = process.env.RHID_API_USERNAME;
+    this.rhidPassword = process.env.RHID_API_PASSWORD;
+    this.totvsApiUrl = process.env.URL_API_TOTVS;
+    this.totvsBasicAuth = process.env.TOKEN_API_TOTVS;
+    this.pathImportacaoTotvs = process.env.PATH_IMPORTACAO_TOTVS;
 
     this.axiosInstance = axios.create({
       timeout: 60000, // 60 segundos timeout para downloads grandes
@@ -655,10 +649,47 @@ export class ImportacaoBatidasService {
 
         if (jobResult && jobResult.length > 0) {
           const jobInfo = jobResult[0];
-          const conteudoAfdBase64 = Buffer.from(conteudoAfd).toString('base64');
+
+          let s3Bucket: string | null = null;
+          let s3Key: string | null = null;
+          let s3Location: string | null = null;
+
+          try {
+            // 1. Construir o nome do arquivo para o S3
+            const dataFormatada = this.formatarDataBR(dataReferencia);
+            const nomeArquivoS3 = `${dataFormatada} ${
+              equipamentoRhid.name
+            } ${randomUUID()}.txt`;
+
+            // 2. Fazer o upload do arquivo AFD para o S3
+            const bucket = process.env.VULTR_S3_BUCKET_NAME;
+            if (!bucket) {
+              throw new Error(
+                'S3_BUCKET_NAME não está configurado nas variáveis de ambiente.',
+              );
+            }
+
+            const pasta = 'afd-importacao';
+            const key = `${pasta}/${nomeArquivoS3}`;
+
+            const s3Response = await this.s3Service.upload(
+              bucket,
+              key,
+              conteudoAfd,
+              'text/plain',
+            );
+            s3Bucket = s3Response.Bucket;
+            s3Key = s3Response.Key;
+            s3Location = s3Response.Location;
+          } catch (s3Error) {
+            console.error(
+              '❌ Erro ao fazer upload do arquivo para o S3:',
+              s3Error,
+            );
+          }
 
           console.log(
-            `✍️  Registrando log do job ${jobInfo.ID_Job} no banco de dados...`,
+            `✍️  Registrando log do job ${jobInfo.ID_Job} no banco de dados com referência S3...`,
           );
 
           await this.prismaService.$executeRaw`
@@ -666,22 +697,26 @@ export class ImportacaoBatidasService {
                   ID_Job,
                   CD_Coligada_Execucao,
                   NM_Equipamento,
-                  TX_Arquivo,
                   ID_Status_Job,
                   CD_Usuario_Criacao,
                   DH_Criacao,
                   IN_Notificacao_Enviada,
-                  IN_Importacao_Realizada
+                  IN_Importacao_Realizada,
+                  NM_S3_Bucket_Arquivo,
+                  CD_S3_Key_Arquivo,
+                  TX_S3_URL_Arquivo
               ) VALUES (
                   ${jobInfo.ID_Job},
                   ${equipamento.CD_Coligada},
                   ${equipamentoRhid.name},
-                  ${conteudoAfdBase64},
                   ${jobInfo.ID_Status_Job},
                   ${jobInfo.CD_Usuario},
                   ${jobInfo.DH_Criacao},
                   0,
-                  0
+                  0,
+                  ${s3Bucket},
+                  ${s3Key},
+                  ${s3Location}
               )
           `;
 

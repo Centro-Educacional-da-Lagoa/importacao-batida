@@ -12,6 +12,7 @@ import { BullModule } from '@nestjs/bull';
 import { PrismaModule } from './prisma/prisma.module';
 import { NotificacaoRotinaModule } from './notificacao-rotina/notificacao-rotina.module';
 import { ChatModule } from './google/chat/chat.module';
+import { S3Module } from './s3/s3.module';
 
 @Module({
   imports: [
@@ -32,6 +33,7 @@ import { ChatModule } from './google/chat/chat.module';
     PrismaModule,
     NotificacaoRotinaModule,
     ChatModule,
+    S3Module,
   ],
 
   controllers: [AppController],
