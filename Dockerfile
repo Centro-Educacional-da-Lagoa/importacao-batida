@@ -1,5 +1,5 @@
 # Use a versão LTS do Node.js como base
-FROM node:21-alpine
+FROM node:22-alpine
 # ENV TZ="America/Sao_Paulo"
 
 # Defina a pasta de trabalho

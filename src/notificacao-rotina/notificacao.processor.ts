@@ -280,7 +280,7 @@ export class NotificacaoProcessor {
 ` +
       `*ID Job:* ${processo.ID_Job}
 ` +
-      `*Coligada:* ${processo.CD_Coligada_Execucao}
+      `*Coligada de Execução:* ${processo.CD_Coligada_Execucao}
 ` +
       `*Equipamento:* ${processo.NM_Equipamento}
 ` +

@@ -5,4 +5,4 @@ services:
     image: redis:latest
     hostname: redis
     ports:
-      - '6379:6379'
+      - '63790:6379'

@@ -1,7 +1,6 @@
-import { Injectable, HttpException } from '@nestjs/common';
+import { Injectable, HttpException, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import axios, { AxiosInstance } from 'axios';
-import * as path from 'path';
 import {
   ProcessarAfdDto,
   ResultadoProcessamentoAfd,
@@ -20,11 +19,16 @@ import { GoogleDriveService } from '../google-drive/google-drive.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
 import { randomUUID } from 'crypto';
+import { getTotvsTableName } from 'src/utils/get-table-corpore';
+import { InjectQueue } from '@nestjs/bull';
+import { Queue } from 'bull';
+import { ImportacaoJobData } from './importacaoBatidas.processor';
 
 const delay = (ms: number) => new Promise((res) => setTimeout(res, ms));
 
 @Injectable()
 export class ImportacaoBatidasService {
+  private readonly logger = new Logger(ImportacaoBatidasService.name);
   private accessToken: string | null = null;
   private rhidApiUrl: string;
   private rhidUsername: string;
@@ -32,6 +36,7 @@ export class ImportacaoBatidasService {
   private totvsApiUrl: string;
   private totvsBasicAuth: string;
   private pathImportacaoTotvs: string;
+  private readonly tableCorpore: string = getTotvsTableName();
 
   private axiosInstance: AxiosInstance;
 
@@ -39,6 +44,8 @@ export class ImportacaoBatidasService {
     private readonly googleDriveService: GoogleDriveService,
     private readonly prismaService: PrismaService,
     private readonly s3Service: S3Service,
+    @InjectQueue('importacao-batidas')
+    private readonly importacaoQueue: Queue<ImportacaoJobData>,
   ) {
     if (!process.env.RHID_API_URL)
       throw new Error('Missing required environment variable: RHID_API_URL');
@@ -72,100 +79,104 @@ export class ImportacaoBatidasService {
   }
 
   /**
-   * Cron job executado a cada 2 horas
-   * Processa AFD de todos os equipamentos mapeados para a data atual
+   * Cron job que enfileira a importação a cada 2 horas.
    */
-  // @Cron('0 */2 * * *')
-  async executarImportacaoAutomatica() {
-    console.log(
-      '🕐 Iniciando importação automática de AFD - ' + new Date().toISOString(),
+  @Cron('0 */2 * * *')
+  async agendarImportacaoAutomatica() {
+    this.logger.log(
+      '🕐 Agendando importação automática de AFD para todos os equipamentos.',
     );
-
-    try {
-      const resultado = await this.processarAfd({});
-
-      console.log('✅ Importação automática concluída:', {
-        total: resultado.totalEquipamentos,
-        sucessos: resultado.sucessos,
-        falhas: resultado.falhas,
-      });
-
-      if (resultado.falhas > 0) {
-        console.log(
-          '⚠️ Equipamentos com falha:',
-          resultado.resultados
-            .filter((r) => !r.sucesso)
-            .map((r) => `${r.equipamentoNome} (${r.mensagem})`),
-        );
-      }
-    } catch (error) {
-      console.log(
-        '🚀 ~ ImportacaoBatidasService ~ executarImportacaoAutomatica ~ error:',
-        error,
-      );
-    }
+    await this.executarRotina();
   }
 
   /**
-   * Método principal: processa AFD dos equipamentos especificados
+   * Lógica principal da rotina: busca equipamentos e os enfileira para processamento.
+   * Inclui a lógica de inversão de coligada.
+   */
+  async executarRotina(): Promise<{
+    message: string;
+    jobsEnfileirados: number;
+  }> {
+    const dataReferencia = new Date();
+    let jobsEnfileirados = 0;
+
+    for (const equipamento of EQUIPAMENTOS_MAPEADOS) {
+      // Enfileirar para a coligada original
+      await this.adicionarJobFila(equipamento, dataReferencia);
+      jobsEnfileirados++;
+
+      // Lógica de inversão de coligada
+      const coligadaInvertida = this.getColigadaInvertida(
+        equipamento.CD_Coligada,
+      );
+      if (coligadaInvertida) {
+        const equipamentoInvertido = {
+          ...equipamento,
+          CD_Coligada: coligadaInvertida,
+        };
+        await this.adicionarJobFila(equipamentoInvertido, dataReferencia);
+        jobsEnfileirados++;
+      }
+    }
+
+    this.logger.log(
+      `${jobsEnfileirados} jobs foram enfileirados para processamento.`,
+    );
+    return {
+      message: `${jobsEnfileirados} jobs enfileirados com sucesso.`,
+      jobsEnfileirados,
+    };
+  }
+
+  private getColigadaInvertida(coligada: number): number | null {
+    if (coligada === 1) return 5;
+    if (coligada === 5) return 1;
+    return null;
+  }
+
+  private async adicionarJobFila(
+    equipamento: EquipamentoMapeado,
+    dataReferencia: Date,
+  ) {
+    const jobData: ImportacaoJobData = {
+      equipamento,
+      dataReferencia: dataReferencia.toISOString(),
+    };
+    const jobId = `importacao-${equipamento.id}-${equipamento.CD_Coligada}-${dataReferencia.getTime()}`;
+
+    await this.importacaoQueue.add(jobData, {
+      jobId,
+      attempts: 3,
+      backoff: {
+        type: 'exponential',
+        delay: 60000, // 1 minuto
+      },
+    });
+    this.logger.log(`Job ${jobId} adicionado à fila.`);
+  }
+
+  /**
+   * Método para processamento síncrono, utilizado pelo endpoint manual.
    */
   async processarAfd(
     params: ProcessarAfdDto,
   ): Promise<ResultadoProcessamentoAfd> {
     const dataReferencia = params.dataReferencia || new Date();
     const equipamentosIds = params.equipamentosIds;
-
     const resultados: ResultadoProcessamentoEquipamento[] = [];
 
-    try {
-      // Passo 1: Autenticar na API RHiD
-      await this.autenticarRhid();
+    await this.autenticarRhid();
 
-      // Passo 2: Buscar equipamentos válidos
-      const equipamentosValidos =
-        await this.buscarEquipamentos(equipamentosIds);
+    const equipamentosParaProcessar = equipamentosIds
+      ? EQUIPAMENTOS_MAPEADOS.filter((e) => equipamentosIds.includes(e.id))
+      : EQUIPAMENTOS_MAPEADOS;
 
-      console.log(
-        `🔍 ${equipamentosValidos.length} equipamento(s) válido(s) encontrado(s)`,
+    for (const equipamentoMapeado of equipamentosParaProcessar) {
+      const resultado = await this.processarUmEquipamento(
+        equipamentoMapeado,
+        dataReferencia,
       );
-
-      // Passo 3-5: Processar cada equipamento
-      for (const equipamentoRhid of equipamentosValidos) {
-        const equipamentoMapeado = EQUIPAMENTOS_MAPEADOS.find(
-          (e) => e.id === equipamentoRhid.id,
-        );
-
-        if (!equipamentoMapeado) {
-          console.log(
-            `⚠️ Equipamento ${equipamentoRhid.id} não encontrado no mapeamento`,
-          );
-          resultados.push({
-            equipamentoId: equipamentoRhid.id,
-            equipamentoNome: equipamentoRhid.name,
-            sucesso: false,
-            etapa: 'busca',
-            mensagem: 'Equipamento não mapeado nos EQUIPAMENTOS_MAPEADOS',
-            dataProcessamento: new Date(),
-          });
-          continue;
-        }
-
-        const resultado = await this.processarEquipamento(
-          equipamentoRhid,
-          equipamentoMapeado,
-          dataReferencia,
-        );
-        resultados.push(resultado);
-      }
-    } catch (error) {
-      console.log(
-        '🚀 ~ ImportacaoBatidasService ~ processarAfd ~ error:',
-        error,
-      );
-      throw new HttpException(
-        error instanceof Error ? error.message : 'Erro ao processar AFD',
-        500,
-      );
+      resultados.push(resultado);
     }
 
     const sucessos = resultados.filter((r) => r.sucesso).length;
@@ -182,15 +193,61 @@ export class ImportacaoBatidasService {
   }
 
   /**
-   * Processa um equipamento específico: download, salvamento e importação
+   * Processa um único equipamento. Chamado pelo Processor da fila.
+   */
+  async processarUmEquipamento(
+    equipamentoMapeado: EquipamentoMapeado,
+    dataReferencia: Date,
+  ): Promise<ResultadoProcessamentoEquipamento> {
+    try {
+      if (!this.accessToken) {
+        this.logger.log(
+          'Token de acesso expirado ou inválido. Reautenticando...',
+        );
+        await this.autenticarRhid();
+      }
+
+      const equipamentosRhid = await this.buscarEquipamentos([
+        equipamentoMapeado.id,
+      ]);
+      const equipamentoRhid = equipamentosRhid[0];
+
+      if (!equipamentoRhid) {
+        throw new Error(
+          `Equipamento RHID com ID ${equipamentoMapeado.id} não encontrado ou com status inválido.`,
+        );
+      }
+
+      return await this.processarEquipamento(
+        equipamentoRhid,
+        equipamentoMapeado,
+        dataReferencia,
+      );
+    } catch (error) {
+      this.logger.error(
+        `Falha ao processar equipamento ${equipamentoMapeado.id}: ${error.message}`,
+      );
+      return {
+        equipamentoId: equipamentoMapeado.id,
+        equipamentoNome: `Equipamento Mapeado ID ${equipamentoMapeado.id}`,
+        sucesso: false,
+        etapa: 'busca',
+        mensagem: error.message,
+        dataProcessamento: new Date(),
+      };
+    }
+  }
+
+  /**
+   * Lógica de processamento de um equipamento: download, salvamento e importação.
    */
   private async processarEquipamento(
     equipamentoRhid: RhidDevice,
     equipamentoMapeado: EquipamentoMapeado,
     dataReferencia: Date,
   ): Promise<ResultadoProcessamentoEquipamento> {
-    console.log(
-      `🔧 Processando equipamento: ${equipamentoRhid.name} (ID: ${equipamentoMapeado.id})`,
+    this.logger.log(
+      `🔧 Processando equipamento: ${equipamentoRhid.name} (ID: ${equipamentoMapeado.id}, Coligada: ${equipamentoMapeado.CD_Coligada})`,
     );
 
     const nomeArquivo = `${this.formatarDataBR(dataReferencia)} ${
@@ -199,30 +256,21 @@ export class ImportacaoBatidasService {
     let caminhoArquivoDrive: string | undefined;
 
     try {
-      // Passo 3: Baixar AFD
       const conteudoAfd = await this.baixarAfd(
         equipamentoMapeado.id,
         dataReferencia,
       );
 
-      // Passo 4: Salvar arquivo no Google Drive
       caminhoArquivoDrive = await this.salvarAfdToGoogleDrive(
         conteudoAfd,
         nomeArquivo,
       );
-
-      console.log(`💾 Arquivo salvo no Google Drive: ${caminhoArquivoDrive}`);
-
-      // Adiciona um tempo de espera para garantir a sincronização do arquivo no servidor
-      const tempoDeEspera = 5000; // 5 segundos
-      console.log(
-        `⏱️ Aguardando ${
-          tempoDeEspera / 1000
-        } segundos para sincronização do Google Drive...`,
+      this.logger.log(
+        `💾 Arquivo salvo no Google Drive: ${caminhoArquivoDrive}`,
       );
-      await delay(tempoDeEspera);
 
-      // Passo 5: Executar importação TOTVS
+      await delay(5000); // Espera para sincronização do Google Drive
+
       const sucessoImportacao = await this.executarImportacaoTotvs(
         equipamentoMapeado,
         equipamentoRhid,
@@ -232,18 +280,10 @@ export class ImportacaoBatidasService {
       );
 
       if (!sucessoImportacao) {
-        return {
-          equipamentoId: equipamentoMapeado.id,
-          equipamentoNome: equipamentoRhid.name,
-          sucesso: false,
-          etapa: 'importacao',
-          mensagem: 'Importação TOTVS retornou status diferente de "1"',
-          caminhoArquivo: caminhoArquivoDrive,
-          dataProcessamento: new Date(),
-        };
+        throw new Error('Importação TOTVS retornou status diferente de "1"');
       }
 
-      console.log(
+      this.logger.log(
         `✅ Equipamento ${equipamentoRhid.name} processado com sucesso`,
       );
 
@@ -257,21 +297,17 @@ export class ImportacaoBatidasService {
         dataProcessamento: new Date(),
       };
     } catch (error) {
-      console.log(
-        `🚀 ~ ImportacaoBatidasService ~ processarEquipamento ~ ${equipamentoRhid.name} ~ error:`,
-        error,
+      this.logger.error(
+        `❌ Erro no processamento do equipamento ${equipamentoRhid.name}: ${error.message}`,
       );
-
-      const mensagemErro =
-        error instanceof Error ? error.message : 'Erro desconhecido';
 
       return {
         equipamentoId: equipamentoMapeado.id,
         equipamentoNome: equipamentoRhid.name,
         sucesso: false,
-        etapa: 'download', // Etapa pode variar, mas 'download' ou 'salvamento' são as mais prováveis
-        mensagem: mensagemErro,
-        caminhoArquivo: caminhoArquivoDrive, // Adiciona o link do drive mesmo em caso de falha (se disponível)
+        etapa: 'importacao', // Assumindo que a falha pode ocorrer em qualquer etapa
+        mensagem: error.message,
+        caminhoArquivo: caminhoArquivoDrive,
         dataProcessamento: new Date(),
       };
     }
@@ -282,8 +318,7 @@ export class ImportacaoBatidasService {
    */
   private async autenticarRhid(): Promise<void> {
     try {
-      console.log('🔐 Autenticando na API RHiD...');
-
+      this.logger.log('🔐 Autenticando na API RHiD...');
       const response = await this.axiosInstance.post(
         `${this.rhidApiUrl}/login`,
         {
@@ -291,23 +326,15 @@ export class ImportacaoBatidasService {
           password: this.rhidPassword,
         },
       );
-
       const loginData: RhidLoginResponse = rhidLoginResponseSchema.parse(
         response.data,
       );
       this.accessToken = loginData.accessToken;
-
-      console.log('✅ Autenticação RHiD bem-sucedida');
+      this.logger.log('✅ Autenticação RHiD bem-sucedida');
     } catch (error) {
-      console.log(
-        '🚀 ~ ImportacaoBatidasService ~ autenticarRhid ~ error:',
-        error,
-      );
-      throw new Error(
-        `Falha na autenticação RHiD: ${
-          error instanceof Error ? error.message : error
-        }`,
-      );
+      this.accessToken = null; // Garante que o token seja invalidado em caso de falha
+      this.logger.error(`Falha na autenticação RHiD: ${error.message}`);
+      throw new Error(`Falha na autenticação RHiD: ${error.message}`);
     }
   }
 
@@ -317,81 +344,57 @@ export class ImportacaoBatidasService {
   private async buscarEquipamentos(
     equipamentosIds?: number[],
   ): Promise<RhidDevice[]> {
-    try {
-      console.log('🔍 Buscando equipamentos na API RHiD...');
+    this.logger.log('🔍 Buscando equipamentos na API RHiD...');
+    const equipamentosProcurar =
+      equipamentosIds || EQUIPAMENTOS_MAPEADOS.map((e) => e.id);
+    const equipamentosEncontrados: RhidDevice[] = [];
+    let start = 0;
+    const length = 100;
 
-      const equipamentosProcurar =
-        equipamentosIds || EQUIPAMENTOS_MAPEADOS.map((e) => e.id);
-      const equipamentosEncontrados: RhidDevice[] = [];
-      let start = 0;
-      const length = 100;
+    while (true) {
+      const response = await this.axiosInstance.get(
+        `${this.rhidApiUrl}/device`,
+        {
+          params: { start, length },
+          headers: { Authorization: `Bearer ${this.accessToken}` },
+        },
+      );
+      const data: RhidDevicesResponse = rhidDevicesResponseSchema.parse(
+        response.data,
+      );
 
-      while (true) {
-        const response = await this.axiosInstance.get(
-          `${this.rhidApiUrl}/device`,
-          {
-            params: { start, length },
-            headers: {
-              Authorization: `Bearer ${this.accessToken}`,
-            },
-          },
-        );
-
-        const data: RhidDevicesResponse = rhidDevicesResponseSchema.parse(
-          response.data,
-        );
-
-        // Filtrar equipamentos que precisamos e que têm status OK
-        for (const device of data.records) {
-          if (equipamentosProcurar.includes(device.id)) {
-            if (device.status === 'OK') {
-              equipamentosEncontrados.push(device);
-            } else {
-              console.log(
-                `⚠️ Equipamento ${device.id} (${device.name}) possui status inválido: ${device.status}`,
-              );
-            }
+      for (const device of data.records) {
+        if (equipamentosProcurar.includes(device.id)) {
+          if (device.status === 'OK') {
+            equipamentosEncontrados.push(device);
+          } else {
+            this.logger.warn(
+              `⚠️ Equipamento ${device.id} (${device.name}) com status inválido: ${device.status}`,
+            );
           }
         }
-
-        // Verificar se encontramos todos os equipamentos necessários
-        const todosEncontrados = equipamentosProcurar.every((id) =>
-          equipamentosEncontrados.some((e) => e.id === id),
-        );
-
-        if (todosEncontrados || start + length >= data.totalRecords) {
-          break;
-        }
-
-        start += length;
       }
 
-      // Alertar sobre equipamentos não encontrados
-      const idsEncontrados = equipamentosEncontrados.map((e) => e.id);
-      const naoEncontrados = equipamentosProcurar.filter(
-        (id) => !idsEncontrados.includes(id),
-      );
-
-      if (naoEncontrados.length > 0) {
-        console.log(
-          `⚠️ Equipamentos não encontrados na API RHiD: ${naoEncontrados.join(
-            ', ',
-          )}`,
-        );
+      if (
+        start + length >= data.totalRecords ||
+        equipamentosEncontrados.length >= equipamentosProcurar.length
+      ) {
+        break;
       }
+      start += length;
+    }
 
-      return equipamentosEncontrados;
-    } catch (error) {
-      console.log(
-        '🚀 ~ ImportacaoBatidasService ~ buscarEquipamentos ~ error:',
-        error,
-      );
-      throw new Error(
-        `Falha ao buscar equipamentos: ${
-          error instanceof Error ? error.message : error
-        }`,
+    const idsEncontrados = equipamentosEncontrados.map((e) => e.id);
+    const naoEncontrados = equipamentosProcurar.filter(
+      (id) => !idsEncontrados.includes(id),
+    );
+    if (naoEncontrados.length > 0) {
+      this.logger.warn(
+        `⚠️ Equipamentos não encontrados na API RHiD: ${naoEncontrados.join(', ')}`,
       );
     }
+
+    return equipamentosEncontrados;
   }
 
   /**
@@ -401,48 +404,22 @@ export class ImportacaoBatidasService {
     equipamentoId: number,
     dataReferencia: Date,
   ): Promise<string> {
-    try {
-      const dataIni = new Date(dataReferencia);
-
-      const dataFinal = new Date(dataReferencia);
-
-      const dataIniFormatada = this.formatarDataRHiD(dataIni);
-      const dataFinalFormatada = this.formatarDataRHiD(dataFinal);
-      console.log(
-        '🚀 ~ ImportacaoBatidasService ~ baixarAfd ~ dataFinal:',
-        dataIniFormatada,
-      );
-      console.log(
-        '🚀 ~ ImportacaoBatidasService ~ baixarAfd ~ dataFinalFormatada:',
-        dataFinalFormatada,
-      );
-
-      const response = await this.axiosInstance.get(
-        `${this.rhidApiUrl}/report/afd/download`,
-        {
-          params: {
-            idEquipamento: equipamentoId,
-            dataIni: dataIniFormatada,
-            dataFinal: dataFinalFormatada,
-          },
-          headers: {
-            Authorization: `Bearer ${this.accessToken}`,
-          },
+    const dataFormatada = this.formatarDataRHiD(dataReferencia);
+    this.logger.log(`DOWNLOADING ${dataFormatada}`);
+    const response = await this.axiosInstance.get(
+      `${this.rhidApiUrl}/report/afd/download`,
+      {
+        params: {
+          idEquipamento: equipamentoId,
+          dataIni: dataFormatada,
+          dataFinal: dataFormatada,
         },
-      );
-
-      return response.data;
-    } catch (error) {
-      console.log(
-        `🚀 ~ ImportacaoBatidasService ~ baixarAfd ~ equipamento ${equipamentoId} ~ error:`,
-        error,
-      );
-      throw new Error(
-        `Falha ao baixar AFD: ${
-          error instanceof Error ? error.message : error
-        }`,
-      );
-    }
+        headers: {
+          Authorization: `Bearer ${this.accessToken}`,
+        },
+      },
+    );
+    return response.data;
   }
 
   /**
@@ -452,25 +429,12 @@ export class ImportacaoBatidasService {
     conteudo: string,
     nomeArquivo: string,
   ): Promise<string> {
-    try {
-      // TODO: Futuramente implementar remoção de batidas duplicadas antes de salvar
-      const { webViewLink } = await this.googleDriveService.uploadOrUpdateFile(
-        nomeArquivo,
-        conteudo,
-        'text/plain',
-      );
-      return webViewLink;
-    } catch (error) {
-      console.log(
-        '🚀 ~ ImportacaoBatidasService ~ salvarAfdToGoogleDrive ~ error:',
-        error,
-      );
-      throw new Error(
-        `Falha ao salvar arquivo no Google Drive: ${
-          error instanceof Error ? error.message : error
-        }`,
-      );
-    }
+    const { webViewLink } = await this.googleDriveService.uploadOrUpdateFile(
+      nomeArquivo,
+      conteudo,
+      'text/plain',
+    );
+    return webViewLink;
   }
 
   /**
@@ -485,105 +449,19 @@ export class ImportacaoBatidasService {
   ): Promise<boolean> {
     let sucesso = false;
     try {
-      console.log(
-        `📤 Executando importação TOTVS para equipamento ${equipamentoRhid.name}...`,
+      this.logger.log(
+        `📤 Executando importação TOTVS para ${equipamentoRhid.name} na coligada ${equipamento.CD_Coligada}...`,
       );
 
-      const dataInicioImportacao = this.formatarDataTotvs(
+      const dataFormatadaTotvs = this.formatarDataTotvs(
         dataReferencia,
         '00:00:00',
       );
-      const dataFimImportacao = this.formatarDataTotvs(
-        dataReferencia,
-        '00:00:00',
+      const payload = this.construirPayloadTotvs(
+        equipamento,
+        nomeArquivo,
+        dataFormatadaTotvs,
       );
-      const dataSistema = this.formatarDataTotvs(new Date(), '00:00:00');
-
-      const caminhoCompleto = this.pathImportacaoTotvs + nomeArquivo;
-      const filePathTotvs = caminhoCompleto;
-
-      const payload = {
-        ActionModule: 'A',
-        ActionName: 'PtoActionProcImportacaoBatidas',
-        ProcessName: 'Importação de Batidas',
-        ServerName: 'PtoProcImportacaoBatidas',
-        CodUsuario: 'PortalMatriculaInt',
-        Context: {
-          _params: {
-            $EXERCICIOFISCAL: -1,
-            $CODLOCPRT: -1,
-            $CODTIPOCURSO: 1,
-            $EDUTIPOUSR: '-1',
-            $CODUNIDADEBIB: -1,
-            $CODCOLIGADA: equipamento.CD_Coligada,
-            $RHTIPOUSR: '-1',
-            $CODIGOEXTERNO: '-1',
-            $CODSISTEMA: 'A',
-            $CODUSUARIOSERVICO: '',
-            $CODUSUARIO: 'PortalMatriculaInt',
-            $IDPRJ: -1,
-            $CHAPAFUNCIONARIO: '-1',
-          },
-        },
-        CodColigada: equipamento.CD_Coligada,
-        CodigoLayoutRelogio: '001',
-        DataInicioImportacao: dataInicioImportacao,
-        DataFimImportacao: dataFimImportacao,
-        AcertaNatureza: 'ConsiderandoJornada',
-        ConsideraPerfilCadastrado: true,
-        ConsideraNaturezaFixa: false,
-        ConsideraUltimaLinhaParaImportacao: false,
-        AtualizaUltimoNSRDisposisitovosCarol: false,
-        ExibeInatividadeFuncionario: false,
-        DesabilitarFracionamentoJob: false,
-        FromFracionamentoJob: false,
-        SaveLogInDatabase: true,
-        SaveParamsExecution: false,
-        UseJobMonitor: true,
-        OnlineMode: false,
-        SyncExecution: false,
-        NotifyEmail: false,
-        NotifyFluig: false,
-        PrimaryKeyList: [],
-        PrimaryKeyNames: [],
-        FilePath: filePathTotvs,
-        NaturezaFixa: 'Saida',
-        TipoImportacao: 'Arquivo',
-        TerminalColeta: equipamento.CD_Terminal_Coleta.toString(),
-        TempoMinimoEntreBatidas: '00:00',
-        TipoLayout: 'None',
-        PriorizaCracha: false,
-        RecalculaAposImportacao: false,
-        ImportarBatidasAPI: false,
-        QuebraSecao: '???????????????',
-        Selecao: {
-          Chapa: [],
-          CodRecebimento: 'DHMOPQST',
-          CodSituacao: 'ADEFILMOPRSTUVWZ',
-          CodTipo: 'ABCDEFIMNOPRSUXZ',
-          NaoUsaCodReceb: false,
-          NaoUsaSituacao: false,
-          NaoUsaTipoFunc: false,
-          Contexto: {
-            _params: {
-              $EXERCICIOFISCAL: -1,
-              $CODLOCPRT: -1,
-              $CODTIPOCURSO: 1,
-              $EDUTIPOUSR: '-1',
-              $CODUNIDADEBIB: -1,
-              $CODCOLIGADA: equipamento.CD_Coligada,
-              $DATASISTEMA: dataSistema,
-              $RHTIPOUSR: '-1',
-              $CODIGOEXTERNO: '-1',
-              $CODSISTEMA: 'A',
-              $CODUSUARIOSERVICO: '',
-              $CODUSUARIO: 'PortalMatriculaInt',
-              $IDPRJ: -1,
-              $CHAPAFUNCIONARIO: '-1',
-            },
-          },
-        },
-      };
 
       const response = await this.axiosInstance.post(
         `${this.totvsApiUrl}/rest/restprocess/executeprocess/PtoProcImportacaoBatidas`,
@@ -596,175 +474,250 @@ export class ImportacaoBatidasService {
         },
       );
 
-      console.log(
-        `📊 Resposta TOTVS para ${equipamentoRhid.name}:`,
-        response.data,
+      this.logger.log(
+        `📊 Resposta TOTVS para ${equipamentoRhid.name}: ${response.data}`,
       );
-
-      // Validar se retorno é "1" (sucesso)
       sucesso = response.data === '1' || response.data === 1;
 
-      if (sucesso) {
-        console.log(
-          `✅ Importação TOTVS concluída com sucesso para ${equipamentoRhid.name}`,
-        );
-      } else {
-        console.log(
+      if (!sucesso) {
+        this.logger.error(
           `❌ Importação TOTVS falhou para ${equipamentoRhid.name}. Resposta: ${response.data}`,
         );
       }
-
       return sucesso;
     } catch (error) {
-      console.log(
-        `🚀 ~ ImportacaoBatidasService ~ executarImportacaoTotvs ~ ${equipamentoRhid.name} ~ error:`,
-        error,
+      this.logger.error(
+        `💣 Falha catastrófica na importação TOTVS para ${equipamentoRhid.name}: ${error.message}`,
       );
-      throw new Error(
-        `Falha na importação TOTVS: ${
-          error instanceof Error ? error.message : error
-        }`,
-      );
+      throw error;
     } finally {
-      try {
-        // Adiciona um tempo de espera para garantir que o job foi registrado no banco de dados.
-        // O tempo pode precisar de ajuste dependendo do ambiente.
-        await delay(5000);
+      await this.registrarLogImportacao(
+        equipamento,
+        equipamentoRhid,
+        dataReferencia,
+        conteudoAfd,
+      );
+    }
+  }
 
-        console.log('🔍 Buscando informações do job de importação...');
+  private construirPayloadTotvs(
+    equipamento: EquipamentoMapeado,
+    nomeArquivo: string,
+    dataFormatada: string,
+  ) {
+    const filePathTotvs = this.pathImportacaoTotvs + nomeArquivo;
+    const payload = {
+      ActionModule: 'A',
+      ActionName: 'PtoActionProcImportacaoBatidas',
+      ProcessName: 'Importação de Batidas',
+      ServerName: 'PtoProcImportacaoBatidas',
+      CodUsuario: 'PortalMatriculaInt',
+      Context: {
+        _params: {
+          $EXERCICIOFISCAL: -1,
+          $CODLOCPRT: -1,
+          $CODTIPOCURSO: 1,
+          $EDUTIPOUSR: '-1',
+          $CODUNIDADEBIB: -1,
+          $CODCOLIGADA: equipamento.CD_Coligada,
+          $RHTIPOUSR: '-1',
+          $CODIGOEXTERNO: '-1',
+          $CODSISTEMA: 'A',
+          $CODUSUARIOSERVICO: '',
+          $CODUSUARIO: 'PortalMatriculaInt',
+          $IDPRJ: -1,
+          $CHAPAFUNCIONARIO: '-1',
+        },
+      },
+      CodColigada: equipamento.CD_Coligada,
+      CodigoLayoutRelogio: '001',
+      DataInicioImportacao: dataFormatada,
+      DataFimImportacao: dataFormatada,
+      AcertaNatureza: 'ConsiderandoJornada',
+      ConsideraPerfilCadastrado: true,
+      ConsideraNaturezaFixa: false,
+      ConsideraUltimaLinhaParaImportacao: false,
+      AtualizaUltimoNSRDisposisitovosCarol: false,
+      ExibeInatividadeFuncionario: false,
+      DesabilitarFracionamentoJob: false,
+      FromFracionamentoJob: false,
+      SaveLogInDatabase: true,
+      SaveParamsExecution: false,
+      UseJobMonitor: true,
+      OnlineMode: false,
+      SyncExecution: false,
+      NotifyEmail: false,
+      NotifyFluig: false,
+      PrimaryKeyList: [],
+      PrimaryKeyNames: [],
+      FilePath: filePathTotvs,
+      NaturezaFixa: 'Saida',
+      TipoImportacao: 'Arquivo',
+      TerminalColeta: equipamento.CD_Terminal_Coleta.toString(),
+      TempoMinimoEntreBatidas: '00:00',
+      TipoLayout: 'None',
+      PriorizaCracha: false,
+      RecalculaAposImportacao: false,
+      ImportarBatidasAPI: false,
+      QuebraSecao: '???????????????',
+      Selecao: {
+        Chapa: [],
+        CodRecebimento: 'DHMOPQST',
+        CodSituacao: 'ADEFILMOPRSTUVWZ',
+        CodTipo: 'ABCDEFIMNOPRSUXZ',
+        NaoUsaCodReceb: false,
+        NaoUsaSituacao: false,
+        NaoUsaTipoFunc: false,
+        Contexto: {
+          _params: {
+            $EXERCICIOFISCAL: -1,
+            $CODLOCPRT: -1,
+            $CODTIPOCURSO: 1,
+            $EDUTIPOUSR: '-1',
+            $CODUNIDADEBIB: -1,
+            $CODCOLIGADA: equipamento.CD_Coligada,
+            $DATASISTEMA: this.formatarDataTotvs(new Date(), '00:00:00'),
+            $RHTIPOUSR: '-1',
+            $CODIGOEXTERNO: '-1',
+            $CODSISTEMA: 'A',
+            $CODUSUARIOSERVICO: '',
+            $CODUSUARIO: 'PortalMatriculaInt',
+            $IDPRJ: -1,
+            $CHAPAFUNCIONARIO: '-1',
+          },
+        },
+      },
+    };
 
-        const jobResult: any[] = await this.prismaService.$queryRaw`
+    return payload;
+  }
+
+  private async registrarLogImportacao(
+    equipamento: EquipamentoMapeado,
+    equipamentoRhid: RhidDevice,
+    dataReferencia: Date,
+    conteudoAfd: string,
+  ) {
+    try {
+      await delay(5000); // Espera para o job ser registrado no banco
+      this.logger.log('🔍 Buscando informações do job de importação...');
+
+      const query = `
               SELECT TOP 1
                   jobx.IDJOB AS ID_Job,
                   exjb.status AS ID_Status_Job,
                   jobx.codusuario AS CD_Usuario,
                   jobx.datacriacao AS DH_Criacao
-              FROM corpore_erp_manutencao.dbo.gjobx AS jobx (nolock)
-              LEFT JOIN corpore_erp_manutencao.dbo.gjobxexecucaoview AS exjb (nolock)
+              FROM ${this.tableCorpore}.dbo.gjobx AS jobx (nolock)
+              LEFT JOIN ${this.tableCorpore}.dbo.gjobxexecucaoview AS exjb (nolock)
                   ON jobx.idjob = exjb.idjob
               WHERE jobx.codusuario = 'PortalMatriculaInt'
                   AND jobx.classeprocesso = 'PtoProcImportacaoBatidas'
               ORDER BY jobx.datacriacao DESC
           `;
+      const jobResult: any[] = await this.prismaService.$queryRawUnsafe(query);
 
-        if (jobResult && jobResult.length > 0) {
-          const jobInfo = jobResult[0];
+      if (!jobResult || jobResult.length === 0) {
+        this.logger.warn(
+          '⚠️ Não foi possível encontrar o job de importação para registrar o log.',
+        );
+        return;
+      }
 
-          let s3Bucket: string | null = null;
-          let s3Key: string | null = null;
-          let s3Location: string | null = null;
+      const jobInfo = jobResult[0];
+      let s3Bucket: string | null = null;
+      let s3Key: string | null = null;
+      let s3Location: string | null = null;
 
-          try {
-            // 1. Construir o nome do arquivo para o S3
-            const dataFormatada = this.formatarDataBR(dataReferencia);
-            const nomeArquivoS3 = `${dataFormatada} ${
-              equipamentoRhid.name
-            } ${randomUUID()}.txt`;
+      try {
+        const nomeArquivoS3 = `${this.formatarDataBR(dataReferencia)} ${
+          equipamentoRhid.name
+        } ${randomUUID()}.txt`;
+        const bucket = process.env.VULTR_S3_BUCKET_NAME;
+        if (!bucket) throw new Error('VULTR_S3_BUCKET_NAME não configurado');
 
-            // 2. Fazer o upload do arquivo AFD para o S3
-            const bucket = process.env.VULTR_S3_BUCKET_NAME;
-            if (!bucket) {
-              throw new Error(
-                'S3_BUCKET_NAME não está configurado nas variáveis de ambiente.',
-              );
-            }
-
-            const pasta = 'afd-importacao';
-            const key = `${pasta}/${nomeArquivoS3}`;
-
-            const s3Response = await this.s3Service.upload(
-              bucket,
-              key,
-              conteudoAfd,
-              'text/plain',
-            );
-            s3Bucket = s3Response.Bucket;
-            s3Key = s3Response.Key;
-            s3Location = s3Response.Location;
-          } catch (s3Error) {
-            console.error(
-              '❌ Erro ao fazer upload do arquivo para o S3:',
-              s3Error,
-            );
-          }
-
-          console.log(
-            `✍️  Registrando log do job ${jobInfo.ID_Job} no banco de dados com referência S3...`,
-          );
-
-          await this.prismaService.$executeRaw`
-              INSERT INTO BD_SINERGIA.dbo.TB_MDP_Processo_Importacao_Batida (
-                  ID_Job,
-                  CD_Coligada_Execucao,
-                  NM_Equipamento,
-                  ID_Status_Job,
-                  CD_Usuario_Criacao,
-                  DH_Criacao,
-                  IN_Notificacao_Enviada,
-                  IN_Importacao_Realizada,
-                  NM_S3_Bucket_Arquivo,
-                  CD_S3_Key_Arquivo,
-                  TX_S3_URL_Arquivo
-              ) VALUES (
-                  ${jobInfo.ID_Job},
-                  ${equipamento.CD_Coligada},
-                  ${equipamentoRhid.name},
-                  ${jobInfo.ID_Status_Job},
-                  ${jobInfo.CD_Usuario},
-                  ${jobInfo.DH_Criacao},
-                  0,
-                  0,
-                  ${s3Bucket},
-                  ${s3Key},
-                  ${s3Location}
-              )
-          `;
-
-          console.log(
-            `✅ Log do job ${jobInfo.ID_Job} registrado com sucesso.`,
-          );
-        } else {
-          console.log(
-            '⚠️ Não foi possível encontrar o job de importação para registrar o log.',
-          );
-        }
-      } catch (logError) {
-        console.error(
-          '❌ Erro ao registrar o log do job de importação:',
-          logError,
+        const key = `afd-importacao/${nomeArquivoS3}`;
+        const s3Response = await this.s3Service.upload(
+          bucket,
+          key,
+          conteudoAfd,
+          'text/plain',
+        );
+        s3Bucket = s3Response.Bucket;
+        s3Key = s3Response.Key;
+        s3Location = s3Response.Location;
+      } catch (s3Error) {
+        this.logger.error(
+          `❌ Erro ao fazer upload do arquivo para o S3: ${s3Error.message}`,
         );
       }
+
+      this.logger.log(
+        `✍️  Registrando log do job ${jobInfo.ID_Job} no banco de dados...`,
+      );
+      await this.prismaService.$executeRaw`
+            INSERT INTO BD_SINERGIA.dbo.TB_MDP_Processo_Importacao_Batida (
+                ID_Job,
+                CD_Coligada_Execucao,
+                NM_Equipamento,
+                ID_Status_Job,
+                IN_Importacao_Realizada,
+                NM_S3_Bucket_Arquivo,
+                CD_S3_Key_Arquivo,
+                TX_S3_URL_Arquivo,
+                CD_Usuario_Criacao,
+                DH_Criacao,
+                IN_Notificacao_Enviada
+            ) VALUES (
+                ${jobInfo.ID_Job},
+                ${equipamento.CD_Coligada.toString()},
+                ${equipamentoRhid.name},
+                ${jobInfo.ID_Status_Job},
+                1, 
+                ${s3Bucket},
+                ${s3Key},
+                ${s3Location},
+                ${jobInfo.CD_Usuario},
+                ${jobInfo.DH_Criacao},
+                0
+            )
+        `;
+
+      this.logger.log(
+        `✅ Log do job ${jobInfo.ID_Job} registrado com sucesso.`,
+      );
+    } catch (logError) {
+      this.logger.error(
+        `❌ Erro ao registrar o log do job de importação: ${logError.message}`,
+      );
     }
   }
 
   /**
-   * Formatar data no formato DD-MM-YYYY para nome de arquivo
+   * Formata data para nome de arquivo (DD-MM-YYYY)
    */
   private formatarDataBR(data: Date): string {
-    const dia = String(data.getUTCDate()).padStart(2, '0');
-    const mes = String(data.getUTCMonth() + 1).padStart(2, '0');
-    const ano = data.getUTCFullYear();
-    return `${dia}-${mes}-${ano}`;
+    return `${String(data.getUTCDate()).padStart(2, '0')}-${String(
+      data.getUTCMonth() + 1,
+    ).padStart(2, '0')}-${data.getUTCFullYear()}`;
   }
 
   /**
-   * Formatar data no formato DD-MM-YYYY HH:mm para API RHiD
+   * Formata data para API RHiD (MM/DD/YYYY)
    */
   private formatarDataRHiD(data: Date): string {
-    const mes = String(data.getUTCMonth() + 1).padStart(2, '0');
-    const dia = String(data.getUTCDate()).padStart(2, '0');
-    const ano = data.getUTCFullYear();
-
-    return `${mes}/${dia}/${ano}`;
+    return `${String(data.getUTCMonth() + 1).padStart(2, '0')}/${String(
+      data.getUTCDate(),
+    ).padStart(2, '0')}/${data.getUTCFullYear()}`;
   }
 
   /**
-   * Formatar data no formato YYYY-MM-DDTHH:mm:ss para TOTVS
+   * Formata data para TOTVS (YYYY-MM-DDTHH:mm:ss)
    */
   private formatarDataTotvs(data: Date, hora: string): string {
-    const ano = data.getUTCFullYear();
-    const mes = String(data.getUTCMonth() + 1).padStart(2, '0');
-    const dia = String(data.getUTCDate()).padStart(2, '0');
-    return `${ano}-${mes}-${dia}T${hora}`;
+    return `${data.getUTCFullYear()}-${String(data.getUTCMonth() + 1).padStart(
+      2,
+      '0',
+    )}-${String(data.getUTCDate()).padStart(2, '0')}T${hora}`;
   }
 }

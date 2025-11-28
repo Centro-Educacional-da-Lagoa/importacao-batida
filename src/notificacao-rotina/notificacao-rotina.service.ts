@@ -13,7 +13,7 @@ export class NotificacaoRotinaService {
     @InjectQueue('notificacao') private readonly notificacaoQueue: Queue,
   ) {}
 
-  @Cron(CronExpression.EVERY_10_SECONDS)
+  @Cron(CronExpression.EVERY_5_MINUTES)
   async handleCron() {
     this.logger.log('Iniciando rotina de verificação de status de jobs...');
 

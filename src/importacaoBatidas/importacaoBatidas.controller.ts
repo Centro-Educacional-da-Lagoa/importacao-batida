@@ -19,7 +19,29 @@ export class ImportacaoBatidasController {
   ) {}
 
   /**
-   * Endpoint manual para processar importação de AFD
+   * Endpoint para acionar manualmente a rotina de importação de batidas.
+   * A rotina irá enfileirar jobs para cada equipamento e sua coligada invertida.
+   * @returns Uma mensagem de confirmação com o número de jobs enfileirados.
+   */
+  @Post('executar-rotina')
+  @HttpCode(202) // Accepted
+  async executarRotina() {
+    try {
+      console.log('📥 Requisição manual para executar a rotina de importação recebida.');
+      // Não aguarda a conclusão dos jobs, apenas o enfileiramento
+      const resultado = await this.importacaoBatidasService.executarRotina();
+      return resultado;
+    } catch (error) {
+      console.error('💥 Erro ao executar a rotina de importação:', error);
+      throw new HttpException(
+        error instanceof Error ? error.message : 'Erro ao iniciar a rotina de importação',
+        500,
+      );
+    }
+  }
+
+  /**
+   * Endpoint manual para processar importação de AFD de forma síncrona
    * Aceita parâmetros opcionais para data de referência e equipamentos específicos
    *
    * @param data - { dataReferencia?: Date, equipamentosIds?: number[] }
@@ -34,10 +56,12 @@ export class ImportacaoBatidasController {
       // Validar dados de entrada com Zod
       const validatedData = processarAfdSchema.parse({
         ...data,
-        dataReferencia: data.dataReferencia ? new Date(data.dataReferencia) : undefined,
+        dataReferencia: data.dataReferencia
+          ? new Date(data.dataReferencia)
+          : undefined,
       });
 
-      console.log('📥 Requisição manual de importação AFD recebida:', {
+      console.log('📥 Requisição manual de importação AFD síncrona recebida:', {
         dataReferencia: validatedData.dataReferencia || 'data atual',
         equipamentosIds: validatedData.equipamentosIds || 'todos',
       });
