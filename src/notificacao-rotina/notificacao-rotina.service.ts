@@ -37,6 +37,7 @@ export class NotificacaoRotinaService {
       for (const processo of processos) {
         this.logger.log(`Adicionando job à fila: ${JSON.stringify(processo)}`);
         const job = await this.notificacaoQueue.add(processo, {
+          jobId: `notificacao-job-${processo.ID_Job}`,
           attempts: 3, // Tenta reprocessar 3 vezes em caso de falha
           backoff: {
             type: 'exponential',

@@ -101,6 +101,14 @@ export class NotificacaoProcessor {
             `Processo ${ID_Job} não encontrado no banco de dados local.`,
           );
         }
+
+        if (processoCompleto.IN_Notificacao_Enviada) {
+          this.logger.warn(
+            `Notificação para Job ${ID_Job} já foi enviada. Pulando.`,
+          );
+          return;
+        }
+
         let logsS3: LogS3Info[] = [];
         try {
           logsS3 = await this.processarLogsDoJob(ID_Job, processoCompleto);
@@ -184,7 +192,6 @@ export class NotificacaoProcessor {
         const conteudoLog = Buffer.from(log.TX_Conteudo_Log, 'latin1').toString(
           'utf8',
         );
-        console.log(conteudoLog);
 
         const nomeArquivoLog = `${dataFormatada} ${
           processo.NM_Equipamento
