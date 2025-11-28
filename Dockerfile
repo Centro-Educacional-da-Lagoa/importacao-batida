@@ -21,7 +21,7 @@ RUN pnpm i
 RUN npx prisma generate
 
 # Construa a aplicação
-RUN npx nest build
+RUN npx NODE_OPTIONS=--max-old-space-size=4096 nest build
 
 # Execute a aplicação
 CMD ["node", "dist/main"]
