@@ -141,7 +141,7 @@ export class NotificacaoProcessor {
       statusMap[status] ||
       'Job programado para executar, conforme data programada';
 
-    return (
+    let message =
       `*Notificação de Processamento de Job*
 
 ` +
@@ -152,7 +152,12 @@ export class NotificacaoProcessor {
       `*Equipamento:* ${processo.NM_Equipamento}
 ` +
       `*Status:* ${statusText}
-`
-    );
+`;
+
+    if (processo.TX_S3_URL_Arquivo) {
+      message += `*Arquivo AFD Importado:* <${processo.TX_S3_URL_Arquivo}|Visualizar Arquivo>\n`;
+    }
+
+    return message;
   }
 }

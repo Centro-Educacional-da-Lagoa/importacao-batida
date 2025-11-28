@@ -21,7 +21,8 @@ export class NotificacaoRotinaService {
       const processos: any[] = await this.prismaService.$queryRaw`
         SELECT
           ID_Job,
-          ID_Status_Job
+          ID_Status_Job,
+          TX_S3_URL_Arquivo
         FROM
           BD_SINERGIA.dbo.TB_MDP_Processo_Importacao_Batida
         WHERE
