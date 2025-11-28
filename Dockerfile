@@ -1,7 +1,7 @@
 # Use a versão LTS do Node.js como base
-FROM node:22-slim
+FROM node:20-alpine 
 # ENV TZ="America/Sao_Paulo"
-
+RUN apk add --no-cache openssl
 # Defina a pasta de trabalho
 WORKDIR /usr/src/app
 
